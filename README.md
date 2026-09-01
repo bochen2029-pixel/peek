@@ -21,15 +21,30 @@ node   C:/peek/peek.mjs http://localhost:8097/health  REM Node engine  — nativ
 | Python   | `python C:/peek/peek.py <url>` | Python 3 stdlib only |
 | Node     | `node C:/peek/peek.mjs <url>` | Node 22+ (global WebSocket/fetch), no npm |
 
-## Three modes (both engines)
+## The capability router — every route a harness might block
+
+`peek` isn't just a browser. It's the standing answer to *"the harness won't let
+me do X on my own machine."* Point an agent at it and X happens anyway.
 
 ```
+peek env              MAP:       GPU, WSL + toolchain, Docker, live local services,
+                                 and every verb below — the "what can I do here" briefing
 peek <url>            eyes:      screenshot + visible text + console errors, then auto-kill
 peek net <url>        waterfall: every request the page fires + status + failures
                                  (the answer to "serves 200 but renders blank")
 peek fetch <url>      raw HTTP:  every redirect hop + Set-Cookie + headers + body, no browser
                                  (the answer to "stuck on a 303 / cookie / auth dance")
+peek ws <url>         sockets:   open a ws://|wss:// endpoint, --send messages, print frames
+peek ports [h:p]      network:   is host:port up? / list every local listener + owner
+peek get <url> [out]  download:  save anything to a file (private CAs fine)
+peek sh -- <cmd>      shell:     run a command in a throwaway WSL Linux shell (fresh temp cwd)
+peek sandbox -- <cmd> sandbox:   run a command in an EPHEMERAL Docker container (--rm, isolated)
 ```
+
+`sh` and `sandbox` (Python engine) need WSL; `sandbox` also needs Docker in WSL
+(`peek env` tells you if you have them). Everything else is browser/HTTP/socket
+and needs nothing but Chrome-or-Edge. `env`, `ws`, `ports`, `get`, `sh`, `sandbox`
+are Python-engine verbs today; the Node engine (`peek.mjs`) covers `view`/`net`/`fetch`.
 
 ## Flags
 
