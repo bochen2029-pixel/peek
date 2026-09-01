@@ -625,6 +625,101 @@ def run_get(argv):
     print(f"saved: {Path(out).resolve()}  ({len(data):,} bytes, {int((time.time() - t) * 1000)} ms)")
 
 
+def _wsl_sh(script, distro="Ubuntu-24.04", timeout=30):
+    """Run a bash snippet in WSL and return its stdout (empty on any failure)."""
+    try:
+        return subprocess.run(["wsl", "-d", distro, "-u", "root", "--exec", "bash", "-lc", script],
+                              capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _ft_env_probe(force_env=None):
+    """Bash that echoes the fine-tuning conda env's python (first with unsloth/
+    axolotl/trl), or a forced env's python if it exists. One env per line."""
+    import shlex
+    head = (f'[ -x {shlex.quote(force_env)} ] && {{ echo {shlex.quote(force_env)}; exit 0; }}; '
+            if force_env else '')
+    return head + (
+        "for MF in /root/miniforge3 /root/miniconda3 /root/anaconda3 /root/mambaforge "
+        "$HOME/miniforge3 $HOME/miniconda3 $HOME/anaconda3; do [ -x \"$MF/bin/conda\" ] || continue; "
+        "for py in $MF/envs/*/bin/python $MF/bin/python; do [ -x \"$py\" ] || continue; "
+        "for x in unsloth axolotl trl; do [ -x \"$(dirname $py)/$x\" ] && { echo \"$py\"; exit 0; }; done; "
+        "done; done")
+
+
+def run_train(argv):
+    """Shortcut: run a script/command in the fine-tuning conda env (the one with
+    unsloth/axolotl/trl), with the GPU, output streaming live. `peek train` with
+    no command just points you at the resolved env. This is the one-liner an
+    agent uses to drive training without spelling out the env's python path."""
+    import base64 as _b64
+    import posixpath
+    import re
+    import shlex
+    ap = argparse.ArgumentParser(prog="peek train", description="Run a script/command in the fine-tuning env (GPU), streaming.")
+    ap.add_argument("command", nargs=argparse.REMAINDER, help="script.py [args]  OR  a command (torchrun/accelerate/...)")
+    ap.add_argument("--env", help="force a conda env name under /root/miniforge3/envs (default: auto-detect)")
+    ap.add_argument("--distro", default="Ubuntu-24.04")
+    ap.add_argument("--timeout", type=int, default=0, help="seconds (0 = no limit; training runs long)")
+    a = ap.parse_args(argv)
+
+    force = f"/root/miniforge3/envs/{a.env}/bin/python" if a.env else None
+    ftpy = _wsl_sh(_ft_env_probe(force), a.distro)
+    if not ftpy:
+        die("no fine-tuning env found (need a conda env with unsloth/axolotl/trl). Run `peek env` to see what's there.")
+    envbin = posixpath.dirname(ftpy)
+    envname = posixpath.basename(posixpath.dirname(envbin))
+
+    cmd = a.command[1:] if (a.command and a.command[0] == "--") else a.command
+    if not cmd:
+        print(f"fine-tuning env: {envname}   ({ftpy})")
+        models = _wsl_sh("[ -d /root/models ] && { du -sh /root/models 2>/dev/null | cut -f1; ls /root/models 2>/dev/null | tr '\\n' ' '; }", a.distro)
+        if models:
+            m = models.split("\n", 1)
+            print(f"models: /root/models  {m[0]}  ({m[1].strip() if len(m) > 1 else ''})")
+        print("usage:")
+        print("  peek train /root/ft/run.py --epochs 3         # env-python on a script (cwd = its dir)")
+        print("  peek train -- accelerate launch /root/ft/run.py")
+        print("  peek train -- torchrun --nproc_per_node 1 run.py")
+        return
+
+    def wslpath(p):
+        if re.match(r"^[A-Za-z]:", p) or "\\" in p:
+            q = p.replace("\\", "/")
+            d, _, rest = q.partition(":")
+            return f"/mnt/{d.lower()}{rest}"
+        return p
+
+    if cmd[0].lower().endswith(".py"):
+        script = wslpath(cmd[0])
+        rest = cmd[1:]
+        workdir = posixpath.dirname(script) or "."
+        body = (f"cd {shlex.quote(workdir)}\n"
+                f'export PATH={shlex.quote(envbin)}:"$PATH"\n'
+                f"exec {shlex.quote(ftpy)} {shlex.quote(script)} " + " ".join(shlex.quote(x) for x in rest))
+        print(f"train: [{envname}] python {script} {' '.join(rest)}   (cwd {workdir})")
+    else:
+        body = (f'export PATH={shlex.quote(envbin)}:"$PATH"\n'
+                "exec " + " ".join(shlex.quote(x) for x in cmd))
+        print(f"train: [{envname}] " + " ".join(cmd))
+
+    b64 = _b64.b64encode(body.encode()).decode()
+    inner = f"echo {b64} | base64 -d | bash"
+    proc = None
+    try:
+        proc = subprocess.Popen(["wsl", "-d", a.distro, "-u", "root", "--exec", "bash", "-lc", inner])
+        proc.wait(timeout=a.timeout or None)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        die(f"train exceeded {a.timeout}s")
+    except KeyboardInterrupt:
+        if proc:
+            proc.terminate()
+        die("interrupted", 130)
+    print(f"[exit {proc.returncode}]")
+
+
 def _wsl_run(script_b64, distro, timeout, docker=False, image="alpine", mount=None):
     """Run a base64'd shell script inside WSL (or an ephemeral Docker container
     in WSL). base64 sidesteps all quoting between Windows -> wsl -> bash -> the
@@ -849,7 +944,8 @@ def main():
     # the thing that's hanging.
     argv = sys.argv[1:]
     routes = {"fetch": run_fetch, "net": run_net, "ws": run_ws, "ports": run_ports,
-              "get": run_get, "sh": run_sh, "sandbox": run_sandbox, "env": run_env, "view": run_view}
+              "get": run_get, "sh": run_sh, "sandbox": run_sandbox, "train": run_train,
+              "env": run_env, "view": run_view}
     if argv and argv[0] in routes:
         return routes[argv[0]](argv[1:])
     if argv and argv[0] in ("-h", "--help", "help"):
@@ -863,6 +959,7 @@ def main():
         print("  get <url> [out]  download anything to a file")
         print("  sh -- <cmd>      run a command in a throwaway WSL shell")
         print("  sandbox -- <cmd> run a command in an ephemeral Docker container")
+        print("  train [script]   run in the fine-tuning conda env with the GPU (streaming)")
         return
     return run_view(argv)
 

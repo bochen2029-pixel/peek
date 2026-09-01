@@ -39,12 +39,15 @@ peek ports [h:p]      network:   is host:port up? / list every local listener + 
 peek get <url> [out]  download:  save anything to a file (private CAs fine)
 peek sh -- <cmd>      shell:     run a command in a throwaway WSL Linux shell (fresh temp cwd)
 peek sandbox -- <cmd> sandbox:   run a command in an EPHEMERAL Docker container (--rm, isolated)
+peek train [script]   GPU:       run in the fine-tuning conda env (auto-detected) with the GPU, streaming
 ```
 
-`sh` and `sandbox` (Python engine) need WSL; `sandbox` also needs Docker in WSL
-(`peek env` tells you if you have them). Everything else is browser/HTTP/socket
-and needs nothing but Chrome-or-Edge. `env`, `ws`, `ports`, `get`, `sh`, `sandbox`
-are Python-engine verbs today; the Node engine (`peek.mjs`) covers `view`/`net`/`fetch`.
+`sh` / `sandbox` / `train` need WSL; `sandbox` also needs Docker in WSL; `train`
+needs a conda env carrying unsloth/axolotl/trl (`peek env` shows all of this).
+Everything else is browser/HTTP/socket and needs nothing but Chrome-or-Edge.
+
+**Engine coverage:** both `peek.py` and `peek.mjs` do `view / net / fetch / env /
+sh / sandbox / train`. `ws / ports / get` are Python-engine only for now.
 
 ## Flags
 

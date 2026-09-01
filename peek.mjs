@@ -19,8 +19,9 @@
  *
  * PEEK_BROWSER=<path to chrome.exe> overrides browser discovery.
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -300,16 +301,180 @@ async function runFetch(url, o) {
   }
 }
 
+// ================= WSL verbs (env / sh / sandbox / train) =================
+const B64 = (s) => Buffer.from(s).toString('base64')
+const DISTRO = 'Ubuntu-24.04'
+
+function wslCap(script, distro = DISTRO, timeout = 40000) {
+  try {
+    const r = spawnSync('wsl', ['-d', distro, '-u', 'root', '--exec', 'bash', '-lc', script],
+      { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024 })
+    return (r.stdout || '').trim()
+  } catch { return '' }
+}
+
+function streamWsl(inner, distro = DISTRO, timeoutS = 0) {
+  return new Promise((res) => {
+    const p = spawn('wsl', ['-d', distro, '-u', 'root', '--exec', 'bash', '-lc', inner], { stdio: 'inherit' })
+    if (timeoutS) setTimeout(() => { try { p.kill() } catch { /* gone */ } }, timeoutS * 1000)
+    p.on('exit', (code) => res(code ?? -1))
+  })
+}
+
+function splitArgs(raw, valueFlags) {
+  const flags = {}, rest = []
+  for (let i = 0; i < raw.length; i++) {
+    const a = raw[i]
+    if (a === '--') continue
+    if (a.startsWith('--') && valueFlags.includes(a.slice(2)) && raw[i + 1] !== undefined) { flags[a.slice(2)] = raw[++i]; continue }
+    rest.push(a)
+  }
+  return { flags, rest }
+}
+
+const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
+const toWslPath = (p) => (/^[A-Za-z]:/.test(p) || p.includes('\\'))
+  ? (() => { const q = p.replace(/\\/g, '/'); const [d, ...r] = q.split(':'); return `/mnt/${d.toLowerCase()}${r.join(':')}` })()
+  : p
+
+// The one rig probe, shared with peek.py: tagged lines a caller parses.
+const RIG_BASH =
+  "echo SYSPY=$(python3 --version 2>&1 | awk '{print $2}'); seen=; " +
+  "for MF in /root/miniforge3 /root/miniconda3 /root/anaconda3 /root/mambaforge $HOME/miniforge3 $HOME/miniconda3 $HOME/anaconda3; do " +
+  "[ -x \"$MF/bin/conda\" ] || continue; rp=$(readlink -f \"$MF\"); case \" $seen \" in *\" $rp \"*) continue;; esac; seen=\"$seen $rp\"; echo CONDA=$rp; " +
+  "for py in $MF/bin/python $MF/envs/*/bin/python; do [ -x \"$py\" ] || continue; " +
+  "en=$(basename $(dirname $(dirname \"$py\"))); [ \"$en\" = \"$(basename $MF)\" ] && en=base; " +
+  "t=$(\"$py\" -c 'import torch;print(torch.__version__, torch.cuda.is_available())' 2>/dev/null); [ -n \"$t\" ] || continue; " +
+  "tl=; for x in unsloth axolotl trl accelerate torchrun deepspeed llamafactory-cli vllm; do [ -x \"$(dirname $py)/$x\" ] && tl=\"$tl $x\"; done; " +
+  "echo \"ENV=$en|$py|$t|$tl\"; done; done; " +
+  "[ -d /root/models ] && echo \"MODELS=$(du -sh /root/models 2>/dev/null|cut -f1)|$(ls /root/models 2>/dev/null|tr '\\n' ' ')\"; " +
+  "ls -d /root/llama.cpp* 2>/dev/null | head -1 | sed 's/^/LLAMACPP=/'"
+
+const FT_PROBE = (force) => (force ? `[ -x ${shq(force)} ] && { echo ${shq(force)}; exit 0; }; ` : '') +
+  "for MF in /root/miniforge3 /root/miniconda3 /root/anaconda3 /root/mambaforge $HOME/miniforge3 $HOME/miniconda3 $HOME/anaconda3; do [ -x \"$MF/bin/conda\" ] || continue; " +
+  "for py in $MF/envs/*/bin/python $MF/bin/python; do [ -x \"$py\" ] || continue; " +
+  "for x in unsloth axolotl trl; do [ -x \"$(dirname $py)/$x\" ] && { echo \"$py\"; exit 0; }; done; done; done"
+
+function winCap(cmd, args, timeout = 8000) {
+  try { const r = spawnSync(cmd, args, { encoding: 'utf8', timeout }); return (r.stdout || '').trim() } catch { return '' }
+}
+
+async function runEnv() {
+  console.log('=== this machine — what an agent can actually do here ===\n')
+  console.log('host:')
+  console.log(`  Windows, node ${process.version}, python ${(winCap('python', ['--version']).split(' ')[1]) || '?'}`)
+  console.log(`  peek: ${HERE}  (view net fetch ws ports get sh sandbox train env)`)
+  const gpu = winCap('nvidia-smi', ['--query-gpu=name,memory.total,memory.used,memory.free', '--format=csv,noheader'])
+  console.log('\nGPU:\n  ' + (gpu ? gpu.replace(/\n/g, '\n  ') : '(no nvidia-smi / no GPU)'))
+
+  console.log('\nWSL (your Linux — `peek sh -- <cmd>` runs here, isolated from Windows):')
+  const wl = winCap('wsl', ['-l', '-v']).replace(/\0/g, '')
+  wl.split('\n').map((s) => s.trim()).filter(Boolean).slice(1).forEach((l) => console.log('  ' + l.split(/\s+/).join(' ')))
+  let printedRig = false
+  for (const line of wslCap(RIG_BASH).split('\n')) {
+    if (line.startsWith('SYSPY=')) console.log(`  system python ${line.slice(6)} (no torch here — the rig is in conda, below)`)
+    else if (line.startsWith('CONDA=')) {
+      const root = line.slice(6)
+      const names = wslCap(`ls ${root}/envs 2>/dev/null | tr '\\n' ' '`)
+      console.log(`  conda: ${root}  (base ${names})`.trimEnd())
+    } else if (line.startsWith('ENV=')) {
+      if (!printedRig) { console.log('  training rig:'); printedRig = true }
+      const [en, , t, tools] = line.slice(4).split('|')
+      const [ver, cuda] = (t || '').split(' ')
+      const ft = /unsloth|axolotl|trl/.test(tools || '') ? '   <-- fine-tuning' : ''
+      console.log(`    ${(en || '').padEnd(6)} torch ${(ver || '').padEnd(14)} ${cuda === 'True' ? 'cuda✓' : 'cuda✗'}  [${(tools || '').trim()}]${ft}`)
+    } else if (line.startsWith('MODELS=')) {
+      const [sz, lst] = line.slice(7).split('|')
+      console.log(`  models: /root/models  ${sz}  (${(lst || '').trim()})`)
+    } else if (line.startsWith('LLAMACPP=')) console.log(`  llama.cpp: ${line.slice(9)}  (HF->GGUF + LoRA->GGUF converters)`)
+  }
+
+  const dv = wslCap("docker version --format 'docker={{.Server.Version}}' 2>/dev/null; echo images=$(docker images -q 2>/dev/null | wc -l)")
+  console.log('\nDocker (in WSL — `peek sandbox -- <cmd>` = ephemeral --rm container):\n  ' + (dv ? dv.replace(/\n/g, '\n  ') : '(docker not reachable in WSL)'))
+
+  console.log('\nlocal services up right now (`peek ports` for the full list):')
+  const known = { 3080: 'DSH harness web', 8097: 'voice facade (ASR)', 8197: 'voice engine', 8092: 'llama embeddings', 2019: 'caddy admin', 5432: 'postgres', 6379: 'redis', 11434: 'ollama', 8080: 'http-alt' }
+  let anyUp = false
+  for (const port of Object.keys(known).map(Number).sort((a, b) => a - b)) {
+    const up = await new Promise((res) => {
+      const s = net.connect({ host: '127.0.0.1', port, timeout: 400 })
+      s.on('connect', () => { s.destroy(); res(true) })
+      s.on('error', () => res(false))
+      s.on('timeout', () => { s.destroy(); res(false) })
+    })
+    if (up) { console.log(`  :${String(port).padEnd(6)} ${known[port]}`); anyUp = true }
+  }
+  if (!anyUp) console.log('  (none of the usual suspects; run `peek ports` to see everything)')
+  console.log('\nno blocker is real here — if a harness refuses a URL/port/socket/shell, route it through peek.')
+}
+
+async function runSh(raw) {
+  const { flags, rest } = splitArgs(raw, ['distro', 'timeout'])
+  const cmd = rest.join(' ').replace(/^-+\s*/, '').trim()
+  if (!cmd) die('give a command:  node C:/peek/peek.mjs sh -- uname -a')
+  const code = await streamWsl(`cd $(mktemp -d) && echo ${B64(cmd)} | base64 -d | bash`, flags.distro || DISTRO, parseInt(flags.timeout || '120', 10))
+  console.log(`[exit ${code}]`)
+}
+
+async function runSandbox(raw) {
+  const { flags, rest } = splitArgs(raw, ['image', 'mount', 'distro', 'timeout'])
+  const cmd = rest.join(' ').replace(/^-+\s*/, '').trim()
+  if (!cmd) die('give a command:  node C:/peek/peek.mjs sandbox -- python3 -c "print(2**100)"')
+  const image = flags.image || 'alpine'
+  let mount = ''
+  if (flags.mount) { const wp = flags.mount.replace(/\\/g, '/'); const [d, ...r] = wp.split(':'); if (r.length) mount = `-v /mnt/${d.toLowerCase()}${r.join(':')}:/work -w /work ` }
+  console.log(`sandbox: ${image} (ephemeral, --rm)${flags.mount ? '  mount ' + flags.mount + ' -> /work' : ''}`)
+  const code = await streamWsl(`echo ${B64(cmd)} | base64 -d | docker run --rm -i ${mount}${image} sh`, flags.distro || DISTRO, parseInt(flags.timeout || '300', 10))
+  console.log(`[exit ${code}]`)
+}
+
+async function runTrain(raw) {
+  const { flags, rest } = splitArgs(raw, ['env', 'distro', 'timeout'])
+  const distro = flags.distro || DISTRO
+  const ftpy = wslCap(FT_PROBE(flags.env ? `/root/miniforge3/envs/${flags.env}/bin/python` : ''), distro)
+  if (!ftpy) die('no fine-tuning env found (need a conda env with unsloth/axolotl/trl). Run `peek env`.')
+  const envbin = ftpy.replace(/\/[^/]*$/, '')
+  const envname = envbin.replace(/\/bin$/, '').replace(/^.*\//, '')
+  const cmd = rest[0] === '--' ? rest.slice(1) : rest
+  if (!cmd.length) {
+    console.log(`fine-tuning env: ${envname}   (${ftpy})`)
+    const models = wslCap("[ -d /root/models ] && { du -sh /root/models 2>/dev/null|cut -f1; ls /root/models 2>/dev/null|tr '\\n' ' '; }")
+    if (models) { const m = models.split('\n'); console.log(`models: /root/models  ${m[0]}  (${(m[1] || '').trim()})`) }
+    console.log('usage:\n  node C:/peek/peek.mjs train /root/ft/run.py --epochs 3\n  node C:/peek/peek.mjs train -- accelerate launch /root/ft/run.py')
+    return
+  }
+  let body, header
+  if (cmd[0].toLowerCase().endsWith('.py')) {
+    const script = toWslPath(cmd[0]), restArgs = cmd.slice(1)
+    const workdir = script.replace(/\/[^/]*$/, '') || '.'
+    body = `cd ${shq(workdir)}\nexport PATH=${shq(envbin)}:"$PATH"\nexec ${shq(ftpy)} ${shq(script)} ${restArgs.map(shq).join(' ')}`
+    header = `train: [${envname}] python ${script} ${restArgs.join(' ')}   (cwd ${workdir})`
+  } else {
+    body = `export PATH=${shq(envbin)}:"$PATH"\nexec ${cmd.map(shq).join(' ')}`
+    header = `train: [${envname}] ${cmd.join(' ')}`
+  }
+  console.log(header)
+  const code = await streamWsl(`echo ${B64(body)} | base64 -d | bash`, distro, parseInt(flags.timeout || '0', 10))
+  console.log(`[exit ${code}]`)
+}
+
 // ---- arg parsing: `peek.mjs [mode] <url> [flags]`, default mode = view ----
 const raw = process.argv.slice(2)
 let mode = 'view'
-if (['view', 'net', 'fetch'].includes(raw[0])) mode = raw.shift()
-const flags = new Set(raw.filter((a) => a.startsWith('--') && !raw[raw.indexOf(a) + 1]?.startsWith('--')))
+if (['view', 'net', 'fetch', 'env', 'sh', 'sandbox', 'train'].includes(raw[0])) mode = raw.shift()
+
+// WSL/local verbs need no URL — handle them first.
+try {
+  if (mode === 'env') { await runEnv(); process.exit(0) }
+  if (mode === 'sh') { await runSh(raw); process.exit(0) }
+  if (mode === 'sandbox') { await runSandbox(raw); process.exit(0) }
+  if (mode === 'train') { await runTrain(raw); process.exit(0) }
+} catch (e) { die(e.message || String(e)) }
+
 const opt = (name, def) => { const i = raw.indexOf('--' + name); return i >= 0 && raw[i + 1] && !raw[i + 1].startsWith('--') ? raw[i + 1] : def }
 const has = (name) => raw.includes('--' + name)
 const url = raw.find((a) => !a.startsWith('--') && !['view', 'net', 'fetch'].includes(a))
-if (!url) die('give a URL:  node C:/peek/peek.mjs <url>   (or: net <url> | fetch <url>)')
-void flags
+if (!url) die('give a URL:  node C:/peek/peek.mjs <url>   (or: net|fetch|env|sh|sandbox|train ...)')
 
 const o = {
   headful: has('headful'), full: has('full'), keep: has('keep'), text: has('text'), shot: has('shot'),
