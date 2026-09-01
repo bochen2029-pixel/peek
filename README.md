@@ -63,3 +63,7 @@ python C:/peek/peek.py --attach 64993 --js "document.querySelector('[data-voice-
 ```
 
 Pure stdlib. No install. Copy the folder to any Windows box and it runs.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Do whatever you want with it.
