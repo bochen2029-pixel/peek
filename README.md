@@ -1,33 +1,49 @@
 # peek — look at your own localhost
 
 Agent "browser panes" refuse `localhost` / `127.0.0.1` / LAN / private-IP URLs **by
-policy**. You own the machine. `peek` is the standing workaround: a sovereign,
-single-file, pure-stdlib tool that opens **any** URL in a throwaway browser you
-drive over CDP, and hands back a screenshot, the page text, and any console
-errors. No pip, no node, no dependency on any other tool. Any session can call it.
+policy**. You own the machine. `peek` is the standing workaround: a sovereign, zero-
+dependency tool that opens **any** URL in a throwaway browser you drive over CDP and
+hands back a screenshot, the page text, console errors, the network waterfall, or the
+raw HTTP redirect chain. No pip, no npm, no Playwright, no other tool. Any agent, any
+session, any runtime.
 
 ```bat
-python C:/peek/peek.py http://127.0.0.1:3080/
-python C:/peek/peek.py https://192.168.1.112:8443/          REM LAN + private CA: fine
-python C:/peek/peek.py http://localhost:8097/health --text  REM text only, no shot
+peek http://127.0.0.1:3080/               REM if C:\peek is on PATH (it installs itself there)
+python C:/peek/peek.py https://192.168.1.112:8443/    REM Python engine — zero deps
+node   C:/peek/peek.mjs http://localhost:8097/health  REM Node engine  — native WS/fetch, zero deps
 ```
 
-Windows launcher: `C:\peek\peek.cmd <url>` (same args, no `python` on the line).
+## Two engines, pick your runtime (identical behaviour)
 
-## Verbs / flags
+| you're in… | call | needs |
+|---|---|---|
+| anything | `peek <url>` | C:\peek on PATH (auto-added for the user) |
+| Python   | `python C:/peek/peek.py <url>` | Python 3 stdlib only |
+| Node     | `node C:/peek/peek.mjs <url>` | Node 22+ (global WebSocket/fetch), no npm |
+
+## Three modes (both engines)
 
 ```
-peek <url>                 open, wait for load, screenshot + text + console, auto-kill
-    --text                 skip the screenshot (text only)
-    --shot                 skip the text (screenshot only)
-    --full                 full-page capture (beyond the viewport)
-    --headful              visible window instead of headless
-    --js "CODE" | @file    run JS in the page, print its return value
-    --keep                 leave the browser running; print its CDP port
-    --wait S               max seconds to wait for load (default 12)
-    --settle S             extra seconds for SPAs to paint (default 2)
+peek <url>            eyes:      screenshot + visible text + console errors, then auto-kill
+peek net <url>        waterfall: every request the page fires + status + failures
+                                 (the answer to "serves 200 but renders blank")
+peek fetch <url>      raw HTTP:  every redirect hop + Set-Cookie + headers + body, no browser
+                                 (the answer to "stuck on a 303 / cookie / auth dance")
+```
 
-peek --attach <PORT> --js "CODE"    drive a --keep session (click, read, repeat)
+## Flags
+
+```
+--text                 skip the screenshot (text only)
+--shot                 skip the text (screenshot only)
+--full                 full-page capture (beyond the viewport)
+--headful              visible window instead of headless
+--js "CODE" | @file    run JS in the page, print its return value
+--keep                 leave the browser running; print its CDP port  (py: then --attach PORT)
+--all       (net)      list every request, not just problems + document/script
+--head      (fetch)    chain + headers only, skip the body
+-X M --data B -H "K:V" (fetch)  method / body / header, for hitting local JSON APIs
+--wait S / --settle S  load + SPA-paint budgets
 ```
 
 ## Why it works where the pane doesn't

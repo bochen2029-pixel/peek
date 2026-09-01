@@ -361,7 +361,161 @@ def cmd_peek(args):
             kill(proc, prof)
 
 
-def main():
+def run_fetch(argv):
+    """Alternate route #1: raw HTTP, no browser. curl -L -k -c -b in one stdlib
+    command, but it SHOWS the whole chain — every redirect hop, its status and
+    Location, every Set-Cookie — then the final status, headers, and body. This
+    is the tool that instantly explains a page 'stuck on a 303': you watch the
+    token -> cookie -> 200 (or 401) dance hop by hop, without a browser that can
+    hang on it. Supports methods, a body, and custom headers, so it also hits
+    local JSON APIs and WebSocket-less endpoints agents otherwise can't reach."""
+    import http.cookiejar
+    import ssl
+    import urllib.error
+    import urllib.request
+    ap = argparse.ArgumentParser(
+        prog="peek fetch",
+        description="Raw HTTP with full redirect+cookie visibility (no browser). The 303-handshake X-ray.")
+    ap.add_argument("url")
+    ap.add_argument("-X", "--method", default=None, help="HTTP method (default GET, or POST if --data)")
+    ap.add_argument("--data", help="request body (string)")
+    ap.add_argument("-H", "--header", action="append", default=[], metavar="K:V", help="request header (repeatable)")
+    ap.add_argument("--head", action="store_true", help="print the chain + headers only, skip the body")
+    ap.add_argument("--max-chars", type=int, default=8000, help="spill body to a file above this many chars")
+    a = ap.parse_args(argv)
+
+    hops = []
+
+    class Recorder(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            hops.append((code, req.full_url, newurl, headers.get("Set-Cookie")))
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    cj = http.cookiejar.CookieJar()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # private CAs / self-signed dev certs: just work
+    opener = urllib.request.build_opener(
+        Recorder, urllib.request.HTTPCookieProcessor(cj), urllib.request.HTTPSHandler(context=ctx))
+    body = a.data.encode() if a.data else None
+    req = urllib.request.Request(a.url, data=body, method=a.method or ("POST" if body else "GET"))
+    for h in a.header:
+        k, _, v = h.partition(":")
+        req.add_header(k.strip(), v.strip())
+
+    t = time.time()
+    try:
+        resp = opener.open(req, timeout=30)
+        content, status, final, rhdr = resp.read(), resp.status, resp.geturl(), resp.headers
+    except urllib.error.HTTPError as e:
+        content, status, final, rhdr = e.read(), e.code, e.url, e.headers
+    except Exception as e:
+        die(f"fetch failed: {e}")
+    ms = int((time.time() - t) * 1000)
+
+    for code, frm, to, sc in hops:
+        cookie = f"   [Set-Cookie: {sc.split(';', 1)[0]}]" if sc else ""
+        print(f"  {code}  {frm}\n        -> {to}{cookie}")
+    print(f"final: {status}  {final}   ({ms} ms)")
+    for k in ("content-type", "content-length", "location", "server"):
+        if rhdr.get(k):
+            print(f"  {k}: {rhdr.get(k)}")
+    jar = [c.name for c in cj]
+    if jar:
+        print(f"  cookies set: {', '.join(jar)}")
+    if not a.head:
+        text = content.decode("utf-8", "replace")
+        print("\nbody:")
+        if len(text) > a.max_chars:
+            TEXTS.mkdir(exist_ok=True)
+            p = TEXTS / f"fetch_{time.strftime('%H%M%S')}.txt"
+            p.write_text(text, encoding="utf-8")
+            print(text[:a.max_chars])
+            print(f"\n[... {len(text):,} chars total -- full: {p}]")
+        else:
+            print(text or "(empty body)")
+
+
+def run_net(argv):
+    """Alternate route #2: the request waterfall a page actually fires (CDP
+    Network). Every URL the page requests, its status, and any that FAILED —
+    the X-ray for a page that serves 200 but boots to a blank screen, because
+    it shows the one asset/combo that 404'd or hung and killed the boot. Sees
+    what browser-eyes (DOM/screenshot) cannot."""
+    ap = argparse.ArgumentParser(
+        prog="peek net",
+        description="Capture the page's network requests + statuses + failures (why a 200 page renders blank).")
+    ap.add_argument("url")
+    ap.add_argument("--headful", action="store_true")
+    ap.add_argument("--wait", type=float, default=15.0, metavar="S", help="max seconds to watch (default 15)")
+    ap.add_argument("--settle", type=float, default=3.0, metavar="S", help="extra seconds for late XHR (default 3)")
+    ap.add_argument("--all", action="store_true", help="list every request, not just problems + document/script")
+    a = ap.parse_args(argv)
+
+    proc, prof, port = launch("about:blank", a.headful)
+    cdp = None
+    try:
+        cdp = CDP(page_ws(port))
+        for m in ("Network.enable", "Page.enable", "Runtime.enable", "Log.enable"):
+            try:
+                cdp.call(m)
+            except Exception:
+                pass
+        cdp.call("Page.navigate", {"url": a.url})
+        end = time.time() + a.wait
+        while time.time() < end:
+            try:
+                if cdp.eval("document.readyState", timeout=10) == "complete":
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+        time.sleep(a.settle)
+        try:
+            title = cdp.eval("document.title || ''") or ""  # this read also drains trailing events
+        except Exception:
+            title = ""
+
+        reqs = {}
+        order = []
+        for e in cdp.events:
+            m, p = e.get("method"), e.get("params", {})
+            rid = p.get("requestId")
+            if m == "Network.requestWillBeSent" and rid:
+                r = p.get("request", {})
+                reqs[rid] = {"method": r.get("method", "?"), "url": r.get("url", ""),
+                             "type": p.get("type", ""), "status": None, "err": None}
+                order.append(rid)
+            elif m == "Network.responseReceived" and rid in reqs:
+                reqs[rid]["status"] = p.get("response", {}).get("status")
+            elif m == "Network.loadingFailed" and rid in reqs:
+                reqs[rid]["err"] = p.get("errorText", "failed")
+
+        rows = [reqs[r] for r in order]
+        bad = [r for r in rows if r["err"] or (r["status"] and r["status"] >= 400) or r["status"] is None]
+        print(f"page:  {title!r}  --  {len(rows)} requests, {len(bad)} problem(s)")
+        for r in rows:
+            core = r["type"] in ("Document", "Script", "XHR", "Fetch")
+            problem = r["err"] or (r["status"] and r["status"] >= 400) or r["status"] is None
+            if not (a.all or core or problem):
+                continue
+            st = "ERR" if r["err"] else (str(r["status"]) if r["status"] else "...")
+            flag = f"  <== {r['err']}" if r["err"] else (
+                "  <== HANGING (no response)" if r["status"] is None else (
+                    f"  <== {r['status']}" if r["status"] and r["status"] >= 400 else ""))
+            print(f"  {st:>4} {r['method']:4} {r['url'][:118]}{flag}")
+        errs = cdp.console_lines()
+        if errs:
+            print("\nconsole (errors/exceptions):")
+            for line in errs[:20]:
+                print("  " + line[:300])
+    finally:
+        if cdp:
+            cdp.close()
+        kill(proc, prof)
+
+
+def run_view(argv):
     ap = argparse.ArgumentParser(
         prog="peek",
         description="Open any local/LAN URL in a throwaway browser; return screenshot + text + console. "
@@ -384,7 +538,21 @@ def main():
     ap.add_argument("--wait", type=float, default=12.0, metavar="S", help="max seconds to wait for load (default 12)")
     ap.add_argument("--settle", type=float, default=2.0, metavar="S", help="extra seconds for SPAs to paint (default 2)")
     ap.add_argument("--max-chars", type=int, default=100000, help="spill text to a file above this many chars")
-    cmd_peek(ap.parse_args())
+    cmd_peek(ap.parse_args(argv))
+
+
+def main():
+    # Default verb is `view` (so `peek <url>` still works); `fetch` and `net`
+    # are the alternate routes for when the browser view is the wrong lens or
+    # the thing that's hanging.
+    argv = sys.argv[1:]
+    if argv and argv[0] == "fetch":
+        return run_fetch(argv[1:])
+    if argv and argv[0] == "net":
+        return run_net(argv[1:])
+    if argv and argv[0] == "view":
+        return run_view(argv[1:])
+    return run_view(argv)
 
 
 if __name__ == "__main__":
