@@ -1,0 +1,4 @@
+_shots/
+_text/
+__pycache__/
+*.pyc
