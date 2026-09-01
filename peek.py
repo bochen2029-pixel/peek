@@ -740,13 +740,59 @@ def run_env(argv):
     wl = sh(["wsl", "-l", "-v"]).replace("\x00", "")
     for line in [ln.strip() for ln in wl.splitlines() if ln.strip()][1:]:
         print("  " + " ".join(line.split()))
-    tc = wsl("echo py=$(python3 --version 2>&1 | awk '{print $2}'); "
-             "echo pip=$(pip3 --version 2>/dev/null | awk '{print $2}'); "
-             "python3 -c 'import torch;print(\"torch=\"+torch.__version__, \"cuda=\"+str(torch.cuda.is_available()))' 2>/dev/null; "
-             "echo cuda_toolkit=$(nvcc --version 2>/dev/null | grep -oP 'release \\K[0-9.]+' || echo none)")
-    if tc:
-        for line in tc.splitlines():
-            print("  " + line)
+    # Find the ML/fine-tuning rig: a login python3 rarely has torch — it lives
+    # in a conda/mamba env. Enumerate every distro's envs and report torch +
+    # CUDA + training tools, so an agent sees the training rig and how to reach
+    # it (via `peek sh -- <env-python> ...`) instead of assuming there's none.
+    rig = wsl(
+        "echo SYSPY=$(python3 --version 2>&1 | awk '{print $2}'); "
+        "seen=; "
+        "for MF in /root/miniforge3 /root/miniconda3 /root/anaconda3 /root/mambaforge "
+        "$HOME/miniforge3 $HOME/miniconda3 $HOME/anaconda3; do "
+        "  [ -x \"$MF/bin/conda\" ] || continue; "
+        "  rp=$(readlink -f \"$MF\"); case \" $seen \" in *\" $rp \"*) continue;; esac; seen=\"$seen $rp\"; "
+        "  echo CONDA=$rp; "
+        "  for py in $MF/bin/python $MF/envs/*/bin/python; do "
+        "    [ -x \"$py\" ] || continue; "
+        "    en=$(basename $(dirname $(dirname \"$py\"))); [ \"$en\" = \"$(basename $MF)\" ] && en=base; "
+        "    t=$(\"$py\" -c 'import torch;print(torch.__version__, torch.cuda.is_available())' 2>/dev/null); "
+        "    [ -n \"$t\" ] || continue; "
+        "    tl=; for x in unsloth axolotl trl accelerate torchrun deepspeed llamafactory-cli vllm; do "
+        "      [ -x \"$(dirname $py)/$x\" ] && tl=\"$tl $x\"; done; "
+        "    echo \"ENV=$en|$py|$t|$tl\"; "
+        "  done; "
+        "done; "
+        "[ -d /root/models ] && echo \"MODELS=$(du -sh /root/models 2>/dev/null|cut -f1)|$(ls /root/models 2>/dev/null|tr '\\n' ' ')\"; "
+        "ls -d /root/llama.cpp* 2>/dev/null | head -1 | sed 's/^/LLAMACPP=/'",
+        timeout=40)
+    conda_root, printed_rig = None, False
+    for line in rig.splitlines():
+        if line.startswith("SYSPY="):
+            print(f"  system python {line[6:]} (no torch here — the rig is in conda, below)")
+        elif line.startswith("CONDA="):
+            conda_root = line[6:]
+            names = sh(["wsl", "-d", "Ubuntu-24.04", "-u", "root", "--exec", "bash", "-lc",
+                        f"ls {conda_root}/envs 2>/dev/null | tr '\\n' ' '"])
+            print(f"  conda: {conda_root}  (base {names})".rstrip())
+        elif line.startswith("ENV="):
+            if not printed_rig:
+                print("  training rig:")
+                printed_rig = True
+            body = line[4:]
+            en, py, t, tools = (body.split("|", 3) + ["", "", "", ""])[:4]
+            ver, cuda = (t.split() + ["?", "?"])[:2]
+            cflag = "cuda✓" if cuda == "True" else "cuda✗"
+            ft = "   <-- fine-tuning" if any(k in tools for k in ("unsloth", "axolotl", "trl")) else ""
+            print(f"    {en:6} torch {ver:14} {cflag}  [{tools.strip()}]{ft}")
+            if ft:
+                print(f"           run it:  peek sh -- {py} <script.py>")
+        elif line.startswith("MODELS="):
+            sz, lst = (line[7:].split("|", 1) + [""])[:2]
+            print(f"  models: /root/models  {sz}  ({lst.strip()})")
+        elif line.startswith("LLAMACPP="):
+            print(f"  llama.cpp: {line[9:]}  (HF->GGUF + LoRA->GGUF converters)")
+    if not rig.strip():
+        print("  (no conda rig detected; `peek sh -- <cmd>` still gives a full Linux shell)")
 
     dv = wsl("docker version --format 'docker={{.Server.Version}}' 2>/dev/null; "
              "echo images=$(docker images -q 2>/dev/null | wc -l)")
