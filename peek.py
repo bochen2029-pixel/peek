@@ -37,6 +37,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SHOTS = HERE / "_shots"
 TEXTS = HERE / "_text"
+PEEK_VERSION = "0.3.0"   # 0.3: the switchboard — organs answer --about, peek env asks, peek --mcp aggregates, question verbs
 
 
 def die(msg, code=1):
@@ -807,6 +808,15 @@ def run_env(argv):
     the local services already running, and peek's own escape hatches — so it
     knows what it can reach for instead of assuming it's blocked. This is the
     'you have full control here, here's the map' briefing."""
+    # machine forms of the map: --json = the manifest (host + every organ's --about),
+    # --mcp = the one-line registrations (each organ, and peek's own aggregator)
+    if "--json" in argv:
+        print(json.dumps(env_manifest(), ensure_ascii=False))
+        return
+    if "--mcp" in argv:
+        print_mcp_registrations()
+        return
+
     def sh(cmd, timeout=8):
         try:
             return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
@@ -920,26 +930,27 @@ def run_env(argv):
     if not any_up:
         print("  (none of the usual suspects; run `peek ports` to see everything)")
 
-    # The pointer registry: peek is one of a family of sovereign local organs
-    # the owner built to give agents senses the harness denies. List the ones
-    # actually present so a fresh agent DISCOVERS them instead of reinventing
-    # one in frustration (which is exactly how peek itself got rebuilt once).
-    print("\nsovereign tools on this box (yours; each folder has a README — read it for the verbs):")
-    organs = [
-        (r"C:\GPUz\vramtop.exe", "vramtop", "who holds the GPU VRAM, per process  (--stamp | --json | -w | --gui | --mcp)"),
-        (r"C:\kernel.sh\kernel.py", "kernel.sh", "disposable browsers, fan out N at once  (local headless or cloud)"),
-        (r"C:\voice\voice.py", "voice", "local ASR + TTS, OpenAI-shaped  (python C:/voice/voice.py status)"),
-        (r"C:\chunker\chunker.py", "chunker", "size/split a file too big to read in one shot"),
-        (r"C:\tower", "tower", "telemetry bus + append-only tape/  (time-series vitals)"),
-        (r"C:\everywhen", "everywhen", "temporal journal / point-in-time recall"),
-        (r"C:\Intercom", "Intercom", "multi-agent messaging bus"),
-    ]
-    for path, name, desc in organs:
-        if os.path.exists(path):
-            print(f"  {name:<10} {desc}")
+    # The organs: peek is one of a family of sovereign local tools the owner built to
+    # give agents senses the harness denies. Since 0.3 the list is not hardcoded: every
+    # organ that speaks the --about contract describes itself (verbs, MCP, health), and
+    # the ones that predate it get a static card. A fresh agent DISCOVERS them here
+    # instead of reinventing one in frustration (which is how peek itself got rebuilt once).
+    print("\norgans on this box — each answers one question; `peek env --json` is the manifest, `peek env --mcp` the registrations:")
+    print_organ_cards(env_manifest()["organs"])
+
+    print("\npeek asks them for you:")
+    print("  peek find <query> [--grep W]   which files, where they went, which contain W       (facet + everywhere)")
+    print("  peek who [--agents]            who is doing I/O right now, how much, which session  (everywho)")
+    print("  peek gpu                       who holds the VRAM                                   (vramtop)")
+    print("  peek when <words> [--hours N]  which sessions said it                               (everywhen)")
+    print("  peek grep <pattern> [paths]    which files contain it, at drive speed               (everywhere)")
+    print("  peek fleet                     every coding-harness session on the box: pids, cwd, I/O, GPU, ports, last message")
+    print("  peek stamp                     one receipt line: gpu_stamp + io_stamp + listeners")
+    print("  peek doctor [--deep]           is the box ready for agents (each organ's health; --deep runs selftests)")
+    print("  peek --mcp                     ONE MCP server for all of it: the organs' tools + peek's verbs as tools")
 
     print("\nno blocker is real here — if a harness refuses a URL / port / socket / shell / GPU read,")
-    print("route it through peek or one of the tools above. You own this machine; act like it.")
+    print("route it through peek or one of the organs above. You own this machine; act like it.")
 
 
 def run_view(argv):
@@ -968,19 +979,614 @@ def run_view(argv):
     cmd_peek(ap.parse_args(argv))
 
 
+# ============================================================================
+# 0.3 — the switchboard. peek stays Python and zero-dep; the organs stay compiled
+# instruments; what lives here is routing and knowledge: the registry, the --about
+# reader behind `peek env`, one MCP server that fronts every organ, and the question
+# verbs that compose them. Every measurement still comes from an organ.
+# ============================================================================
+
+# The registry: name, where the exe lives, how to ask it about itself, and a static
+# card for organs that predate the contract (or are not present). `--about` wins when
+# it answers; the card is the fallback so peek env never goes blank.
+ORGANS = [
+    dict(name="facet", exe=[r"C:\facet\facet.exe"], about=["--about"],
+         card=dict(purpose="which files (Everything's index), and where they went: directory tree, extension, date, size, write bursts; --grep scans their contents",
+                   verbs=["facet ext:md dm:last3days", "facet -j -x C:\\vendor ext:md dm:today", "facet --grep join ext:md dm:last7days",
+                          "facet --paths Q | everywhere --files-from - -e W -l"],
+                   mcp=dict(command=r"C:\facet\facet.exe", args=["--mcp"], tools=["facet_query", "facet_list", "facet_count"]))),
+    dict(name="everywho", exe=[r"C:\Intellect_AI_tools\everywho\everywho.exe"], about=["--about"],
+         card=dict(purpose="who is touching what, right now: per-process I/O with identity and agent attribution, per-disk rates",
+                   verbs=["everywho", "everywho -j --agents", "everywho --stamp"],
+                   mcp=dict(command=r"C:\Intellect_AI_tools\everywho\everywho.exe", args=["--mcp"], tools=["io_snapshot", "io_stamp"]))),
+    dict(name="vramtop", exe=[r"C:\GPUz\vramtop.exe"], about=["--about"],
+         card=dict(purpose="who holds the GPU VRAM and burns the engines, per process (Task Manager for the GPU)",
+                   verbs=["vramtop", "vramtop --stamp", "vramtop -j", "vramtop --gui"],
+                   mcp=dict(command=r"C:\GPUz\vramtop.exe", args=["--mcp"], tools=["gpu_snapshot", "gpu_stamp"]))),
+    dict(name="everywhen", exe=[r"C:\everywhen\everywhen.exe"], about=["about"],
+         card=dict(purpose="the concordance: full-text search over every Claude Code / DSH session transcript, forks deduped; tapes out, locate in",
+                   verbs=["everywhen search --hours 48 --query facet", "everywhen search --hours 720 --query Q --paths", "everywhen locate - --json"],
+                   mcp=None)),
+    dict(name="everywhere", exe=[r"C:\everywhere\build\Release\everywhere.exe"], about=None,
+         card=dict(purpose="which files CONTAIN this: GPU multi-pattern grep at drive speed, ripgrep-compatible, tapes in and out",
+                   verbs=["everywhere -n -i -e foo -e bar C:\\src", "facet --paths Q | everywhere --files-from - -e word -l",
+                          "everywhere --patterns groups.txt --jsonl C:\\Data"],
+                   mcp=None)),
+    dict(name="everything", exe=[r"C:\Everything\search.py"], about=None, runner="python",
+         card=dict(purpose="instant whole-disk name / path search (Everything 1.4 via es.exe); the index facet pivots",
+                   verbs=["python C:/Everything/search.py \"ext:md dm:today\""], mcp=None)),
+    dict(name="kernel.sh", exe=[r"C:\kernel.sh\kernel.py"], about=None, runner="python",
+         card=dict(purpose="disposable browsers, fan out N at once (local headless or cloud)", verbs=["python C:/kernel.sh/kernel.py --help"], mcp=None)),
+    dict(name="voice", exe=[r"C:\voice\voice.py"], about=None, runner="python",
+         card=dict(purpose="local ASR + TTS, OpenAI-shaped", verbs=["python C:/voice/voice.py status"], mcp=None)),
+    dict(name="chunker", exe=[r"C:\chunker\chunker.py"], about=None, runner="python",
+         card=dict(purpose="size / split a file too big to read in one shot", verbs=["python C:/chunker/chunker.py <file>"], mcp=None)),
+    dict(name="imguard", exe=[r"C:\imguard"], about=None,
+         card=dict(purpose="downsize images before a vision call", verbs=["see C:\\imguard\\README.md"], mcp=None)),
+    dict(name="earshot", exe=[r"C:\earshot"], about=None,
+         card=dict(purpose="audio / video transcripts", verbs=["see C:\\earshot\\README.md"], mcp=None)),
+    dict(name="tower", exe=[r"C:\tower"], about=None,
+         card=dict(purpose="telemetry bus + append-only tape/ (time-series vitals; the spool lanes land here)", verbs=["see C:\\tower\\README.md"], mcp=None)),
+    dict(name="Intercom", exe=[r"C:\Intercom"], about=None,
+         card=dict(purpose="multi-agent messaging bus", verbs=["see C:\\Intercom\\README.md"], mcp=None)),
+]
+
+
+def _organ_path(o):
+    for p in o["exe"]:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _run(cmd, timeout=15):
+    """Run an organ, capture UTF-8 text. Never raises: (code, stdout, stderr)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+    except FileNotFoundError:
+        return 127, "", "not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except Exception as e:  # noqa: BLE001
+        return 1, "", str(e)
+
+
+def organ_about(o):
+    """One organ's card: its own --about when it answers, the registry card otherwise.
+    Normalised keys: name, present, path, version, purpose, verbs[], mcp, health, source."""
+    path = _organ_path(o)
+    card = dict(name=o["name"], present=path is not None, path=path, version=None, purpose=o["card"]["purpose"],
+                verbs=[dict(verb=v, what="", example=v) for v in o["card"]["verbs"]], mcp=o["card"].get("mcp"),
+                health=dict(ok=None, detail="not present" if path is None else "no --about yet (static card)"), source="card")
+    if path is None or not o.get("about"):
+        return card
+    code, out, err = _run([path] + o["about"], timeout=20)
+    line = next((ln for ln in out.splitlines() if ln.startswith("{")), "")
+    try:
+        d = json.loads(line) if line else None
+    except ValueError:
+        d = None
+    if not d:
+        card["health"] = dict(ok=None, detail=f"--about failed ({err.strip()[:80] or 'exit ' + str(code)}); static card")
+        return card
+    card.update(version=d.get("version"), purpose=d.get("purpose") or card["purpose"], verbs=d.get("verbs") or card["verbs"],
+                mcp=d.get("mcp") if d.get("mcp") is not None else card["mcp"], health=d.get("health") or card["health"],
+                docs=d.get("docs"), tape=d.get("tape"), stage=d.get("stage"), source="about")
+    return card
+
+
+def env_manifest():
+    """The machine manifest: host facts + every organ's card. `peek env --json`."""
+    def sh(cmd, timeout=8):
+        c, out, _ = _run(cmd, timeout)
+        return out.strip() if c == 0 else ""
+    host = dict(os="Windows", python=sys.version.split()[0], node=sh(["node", "-v"]) or None, peek=str(HERE), peek_version=PEEK_VERSION,
+                browser=(find_browser() if callable(globals().get("find_browser")) else None))
+    return dict(tool="peek", version=PEEK_VERSION, host=host, organs=[organ_about(o) for o in ORGANS],
+                verbs=["view", "net", "fetch", "ws", "ports", "get", "sh", "sandbox", "train", "env", "find", "who", "gpu", "when", "grep",
+                       "open", "fleet", "stamp", "doctor", "mcp"])
+
+
+def print_organ_cards(cards):
+    for c in cards:
+        if not c["present"]:
+            continue
+        ver = f" {c['version']}" if c.get("version") else ""
+        h = c.get("health") or {}
+        mark = "ok" if h.get("ok") else ("!!" if h.get("ok") is False else "  ")
+        print(f"  {c['name']:<10}{ver:<8} {c['purpose']}")
+        for v in (c.get("verbs") or [])[:4]:
+            ex, what = v.get("example", ""), v.get("what", "")
+            print(f"             {ex:<46} {what}" if what else f"             {ex}")
+        mcp = c.get("mcp")
+        if mcp and mcp.get("command"):
+            reg = mcp.get("register") or f"claude mcp add {c['name']} -- {mcp['command']} {' '.join(mcp.get('args', []))}"
+            print(f"             mcp: {reg}   ({', '.join(mcp.get('tools', []))})")
+        if h.get("detail"):
+            print(f"             [{mark}] {h['detail']}")
+
+
+def print_mcp_registrations():
+    print(f"claude mcp add peek -- {sys.executable} {HERE / 'peek.py'} --mcp      # everything below through ONE server, plus peek's own verbs")
+    for c in env_manifest()["organs"]:
+        mcp = c.get("mcp")
+        if c["present"] and mcp and mcp.get("command"):
+            print(mcp.get("register") or f"claude mcp add {c['name']} -- {mcp['command']} {' '.join(mcp.get('args', []))}")
+
+
+# ---------------------------------------------------------------- the question verbs
+def _organ_exe_or_die(name):
+    o = next(x for x in ORGANS if x["name"] == name)
+    p = _organ_path(o)
+    if not p:
+        die(f"{name} is not on this box (looked at {', '.join(o['exe'])})")
+    if o.get("runner") == "python":
+        return [sys.executable, p]
+    return [p]
+
+
+def _passthrough(cmd):
+    """Hand the console to the organ (its TUI, colours and exit code stay its own)."""
+    try:
+        return subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def run_find(argv):
+    """facet: which files, and where they went; --grep adds everywhere's contents scan."""
+    return _passthrough(_organ_exe_or_die("facet") + argv)
+
+
+def run_who(argv):
+    """everywho: who is doing I/O right now, how much, which session."""
+    return _passthrough(_organ_exe_or_die("everywho") + argv)
+
+
+def run_gpu(argv):
+    """vramtop: who holds the VRAM."""
+    return _passthrough(_organ_exe_or_die("vramtop") + argv)
+
+
+def run_grep(argv):
+    """everywhere: which files contain it, at drive speed (rg-compatible flags)."""
+    return _passthrough(_organ_exe_or_die("everywhere") + argv)
+
+
+def run_open(argv):
+    """everywho --open: who has this file or folder open (ETW tier, Stage 2)."""
+    return _passthrough(_organ_exe_or_die("everywho") + ["--open"] + argv)
+
+
+def run_when(argv):
+    """everywhen: which sessions said it. `peek when <words> [--hours N] [--paths|--json|--count] [--limit N]`
+    (default window: 168 h — a week — because 'when' questions are rarely about today)."""
+    words, extra, hours, i = [], [], "168", 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--hours" and i + 1 < len(argv):
+            hours = argv[i + 1]
+            i += 2
+            continue
+        if a in ("--paths", "--json", "--count", "--limit", "--field", "--project", "--role", "--source"):
+            extra.append(a)
+            if a in ("--limit", "--field", "--project", "--role", "--source") and i + 1 < len(argv):
+                extra.append(argv[i + 1])
+                i += 1
+        else:
+            words.append(a)
+        i += 1
+    if not words:
+        die("peek when <words> [--hours N] [--paths | --json | --count]")
+    return _passthrough(_organ_exe_or_die("everywhen") + ["search", "--hours", hours, "--query", " ".join(words)] + extra)
+
+
+def _listeners():
+    """(local, pid, image) for every LISTENING tcp socket — netstat + tasklist, no elevation."""
+    try:
+        ns = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=15).stdout
+        tl = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=15).stdout
+    except Exception:  # noqa: BLE001
+        return []
+    names = {}
+    for line in tl.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[1].strip('"').isdigit():
+            names[parts[1].strip('"')] = parts[0].strip('"')
+    rows = []
+    for line in ns.splitlines():
+        f = line.split()
+        if len(f) >= 5 and f[0] == "TCP" and f[3] == "LISTENING":
+            rows.append((f[1], f[4], names.get(f[4], "?")))
+    return rows
+
+
+def _json_line(cmd, timeout=30):
+    """Run an organ in its JSON mode and parse the first JSON line (None on failure)."""
+    _, out, _ = _run(cmd, timeout)
+    for ln in out.splitlines():
+        if ln.startswith("{"):
+            try:
+                return json.loads(ln)
+            except ValueError:
+                pass
+    return None
+
+
+def run_stamp(argv):
+    """One receipt line for a log: vramtop's gpu_stamp + everywho's io_stamp + listener count."""
+    want_json = "--json" in argv
+    t = time.strftime("%Y-%m-%dT%H:%M:%S")
+    parts, obj = [], dict(stamp="peek", t=t)
+    v = next((x for x in ORGANS if x["name"] == "vramtop"), None)
+    vp = _organ_path(v) if v else None
+    if vp:
+        _, out, _ = _run([vp, "--stamp"], 15)
+        gpu = out.strip().splitlines()[0] if out.strip() else ""
+        parts.append(gpu)
+        obj["gpu"] = _json_line([vp, "--stamp", "--json"], 15) if want_json else gpu
+    w = next((x for x in ORGANS if x["name"] == "everywho"), None)
+    wp = _organ_path(w) if w else None
+    if wp:
+        _, out, _ = _run([wp, "--stamp", "--sample-ms", "1500"], 20)
+        io = out.strip().splitlines()[0] if out.strip() else ""
+        parts.append(io)
+        obj["io"] = _json_line([wp, "--stamp", "--json", "--sample-ms", "1500"], 20) if want_json else io
+    ls = _listeners()
+    parts.append(f"listen={len(ls)}")
+    obj["listeners"] = len(ls)
+    if want_json:
+        print(json.dumps(obj, ensure_ascii=False))
+    else:
+        print(f"peek_stamp t={t} | " + " | ".join(p for p in parts if p))
+
+
+def run_fleet(argv):
+    """The fleet: every coding-harness session on this box — its processes, working directory,
+    I/O in the last two seconds, VRAM, listening ports, and when it last spoke (everywhen).
+    Built from the organs' JSON; peek owns no number here."""
+    want_json = "--json" in argv
+    wp = _organ_path(next(x for x in ORGANS if x["name"] == "everywho"))
+    if not wp:
+        die("fleet needs everywho (C:\\Intellect_AI_tools\\everywho)")
+    snap = _json_line([wp, "-j", "--sample-ms", "2000", "--top", "2000", "--agents", "--min-mb", "0"], 30) or {}
+    procs = [p for p in snap.get("processes", []) if p.get("agent")]
+    # vram per pid, when vramtop is here
+    vram = {}
+    vp = _organ_path(next(x for x in ORGANS if x["name"] == "vramtop"))
+    if vp:
+        g = _json_line([vp, "-j", "--no-util"], 20) or {}
+        for p in g.get("processes", []) or g.get("procs", []) or []:
+            pid = p.get("pid")
+            b = next((p[k] for k in ("vram_bytes", "resident_bytes", "local_bytes", "vram") if k in p), None)
+            if pid is not None and isinstance(b, (int, float)):
+                vram[int(pid)] = vram.get(int(pid), 0) + int(b)
+    ports = {}
+    for local, pid, _name in _listeners():
+        ports.setdefault(int(pid), []).append(local.rsplit(":", 1)[-1])
+    last = {}
+    ep = _organ_path(next(x for x in ORGANS if x["name"] == "everywhen"))
+    if ep:
+        _, out, _ = _run([ep, "sessions"], 20)
+        for ln in out.splitlines():
+            f = ln.split()
+            if len(f) >= 5 and len(f[0]) == 36:
+                last[f[0]] = f[-1]
+    groups = {}
+    for p in procs:
+        a = p["agent"]
+        key = (a.get("harness") or "?", a.get("project") or "?", a.get("session") or "")
+        g = groups.setdefault(key, dict(harness=key[0], project=key[1], session=key[2], pids=[], write=0, read=0, vram=0, ports=[], cwd=None))
+        g["pids"].append(dict(pid=p["pid"], name=p["name"], rule=a.get("rule")))
+        g["write"] += p.get("file_write") or 0
+        g["read"] += p.get("file_read") or 0
+        g["vram"] += vram.get(p["pid"], 0)
+        g["ports"] += ports.get(p["pid"], [])
+        if p.get("cwd") and (g["cwd"] is None or a.get("rule") in ("image", "cmdline", "tape")):
+            g["cwd"] = p["cwd"]
+    rows = sorted(groups.values(), key=lambda g: (-g["write"], g["project"]))
+    for g in rows:
+        g["last_message"] = last.get(g["session"]) if g["session"] else None
+    if want_json:
+        print(json.dumps(dict(tool="peek", verb="fleet", window_ms=snap.get("window_ms"), sessions=rows), ensure_ascii=False))
+        return
+    print(f"=== fleet — coding-harness sessions on this box ({len(rows)}; window {snap.get('window_ms', 0)} ms) ===")
+    if not rows:
+        print("  (no attributed harness processes right now — everywho --agents sees none)")
+    for g in rows:
+        names = {}
+        for p in g["pids"]:
+            names[p["name"]] = names.get(p["name"], 0) + 1
+        procs_txt = ", ".join(f"{n}×{c}" if c > 1 else n for n, c in sorted(names.items(), key=lambda kv: -kv[1]))
+        sess = (g["session"][:8] + "…") if g["session"] else "session ?"
+        vram_txt = f"{g['vram'] / 1048576:.0f} MB" if g["vram"] else "-"
+        ports_txt = ",".join(sorted(set(g["ports"]))) or "-"
+        print(f"  {g['harness']:<12} {g['project']:<18} {sess:<10} {len(g['pids']):>3} procs  w {g['write'] / 1048576:6.1f} MB  r {g['read'] / 1048576:6.1f} MB  vram {vram_txt:>8}  ports {ports_txt}")
+        print(f"               {procs_txt}")
+        print(f"               cwd {g['cwd'] or '?'}   last message {g['last_message'] or '(not in the concordance yet — everywhen index)'}")
+
+
+def run_doctor(argv):
+    """Is the box ready for agents: every organ's health, plus the substrate (browser, Everything,
+    ETW privilege, WSL, Docker). --deep runs each organ's --selftest too."""
+    deep = "--deep" in argv
+    rows = []
+    def row(state, name, detail):
+        rows.append((state, name, detail))
+    b = find_browser()
+    row("OK" if b else "WARN", "browser", b or "no Chrome/Edge found (set PEEK_BROWSER)")
+    row("OK" if shutil.which("node") else "WARN", "node", shutil.which("node") or "not on PATH (peek.mjs unavailable; peek.py fine)")
+    for c in env_manifest()["organs"]:
+        if not c["present"]:
+            if c["name"] in ("facet", "everywho", "vramtop", "everywhen", "everywhere"):
+                row("WARN", c["name"], "not present")
+            continue
+        h = c.get("health") or {}
+        state = "OK" if h.get("ok") else ("FAIL" if h.get("ok") is False else "OK")
+        row(state, f"{c['name']}{' ' + c['version'] if c.get('version') else ''}", h.get("detail") or "present")
+    wl = _run(["wsl", "-l", "-q"], 10)[1].replace("\x00", "").strip()
+    row("OK" if wl else "WARN", "WSL", (wl.splitlines()[0] if wl else "no distro (peek sh / sandbox / train unavailable)"))
+    dv = _run(["wsl", "-d", "Ubuntu-24.04", "-u", "root", "--exec", "bash", "-lc", "docker version --format '{{.Server.Version}}' 2>/dev/null"], 20)[1].strip()
+    row("OK" if dv else "WARN", "Docker (WSL)", dv or "not reachable (peek sandbox unavailable)")
+    if deep:
+        for name in ("facet", "everywho", "vramtop"):
+            o = next(x for x in ORGANS if x["name"] == name)
+            p = _organ_path(o)
+            if not p:
+                continue
+            code, out, _ = _run([p, "--selftest"], 240)
+            tail = next((ln for ln in reversed(out.splitlines()) if "SELFTEST" in ln), f"exit {code}")
+            row("OK" if code == 0 else "FAIL", f"{name} --selftest", tail.strip())
+    width = max(len(n) for _, n, _ in rows) + 2
+    bad = 0
+    for state, name, detail in rows:
+        bad += state == "FAIL"
+        print(f"  {state:<5} {name:<{width}} {detail}")
+    print(f"{'ALL GOOD' if not bad else str(bad) + ' FAILED'} — {len(rows)} checks{' (deep)' if deep else ''}")
+    return 1 if bad else 0
+
+
+# ---------------------------------------------------------------- peek --mcp: one server for the whole box
+class _McpChild:
+    """An organ's --mcp process behind a pipe: initialize, list its tools, forward calls."""
+
+    def __init__(self, name, cmd):
+        self.name, self.cmd, self.p, self.next_id, self.tools = name, cmd, None, 1000, []
+
+    def start(self):
+        self.p = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        self.request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "peek", "version": PEEK_VERSION}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        r = self.request("tools/list", {}) or {}
+        self.tools = r.get("tools", [])
+
+    def _send(self, obj):
+        self.p.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+        self.p.stdin.flush()
+
+    def request(self, method, params, timeout=300):
+        rid = self.next_id
+        self.next_id += 1
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = self.p.stdout.readline()
+            if not line:
+                raise RuntimeError(f"{self.name} --mcp exited")
+            try:
+                obj = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if obj.get("id") == rid:
+                return obj.get("result") if "result" in obj else {"error": obj.get("error")}
+        raise TimeoutError(f"{self.name} did not answer within {timeout}s")
+
+    def stop(self):
+        if self.p and self.p.poll() is None:
+            try:
+                self.p.stdin.close()
+                self.p.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                self.p.kill()
+
+
+_OWN_TOOLS = [
+    ("peek_view", "Open any URL (localhost / LAN / private IP included) in a throwaway browser: page text, console errors, and the screenshot as an image.",
+     {"url": {"type": "string"}, "text_only": {"type": "boolean"}, "full": {"type": "boolean"}, "js": {"type": "string", "description": "run in the page, return its value"},
+      "wait": {"type": "number"}, "settle": {"type": "number"}}, ["url"]),
+    ("peek_net", "The page's request waterfall: every request, status, failures (why a 200 renders blank).", {"url": {"type": "string"}, "all": {"type": "boolean"}}, ["url"]),
+    ("peek_fetch", "Raw HTTP without a browser: redirect hops, Set-Cookie, headers, body; method / data / headers for local APIs.",
+     {"url": {"type": "string"}, "method": {"type": "string"}, "data": {"type": "string"}, "headers": {"type": "array", "items": {"type": "string"}}, "head": {"type": "boolean"}}, ["url"]),
+    ("peek_ports", "Is host:port up, or list every local listener with its owning process.", {"target": {"type": "string", "description": "host:port; omit to list listeners"}}, []),
+    ("peek_get", "Download any URL to a file (private CAs fine).", {"url": {"type": "string"}, "out": {"type": "string"}}, ["url"]),
+    ("peek_sh", "Run a command in a throwaway WSL Linux shell (fresh temp cwd), streaming output back.", {"cmd": {"type": "string"}, "timeout": {"type": "integer"}}, ["cmd"]),
+    ("peek_sandbox", "Run a command in an ephemeral Docker container inside WSL (--rm, isolated).", {"cmd": {"type": "string"}, "image": {"type": "string"}, "timeout": {"type": "integer"}}, ["cmd"]),
+    ("peek_env", "The machine map: host, GPU, WSL rig, Docker, live services, and every organ's card with verbs, MCP and health.", {"json": {"type": "boolean"}}, []),
+    ("peek_fleet", "Every coding-harness session on the box: processes, cwd, I/O, VRAM, ports, last message.", {}, []),
+    ("peek_stamp", "One receipt line: gpu_stamp + io_stamp + listener count.", {"json": {"type": "boolean"}}, []),
+    ("peek_doctor", "Is the box ready for agents: each organ's health and the substrate; deep runs selftests.", {"deep": {"type": "boolean"}}, []),
+    ("peek_when", "Which sessions said it (everywhen full-text over session transcripts).", {"words": {"type": "string"}, "hours": {"type": "integer"}, "json": {"type": "boolean"}, "paths": {"type": "boolean"}}, ["words"]),
+]
+
+
+def _own_tool_argv(name, a):
+    a = a or {}
+    if name == "peek_view":
+        v = ["view", a["url"]]
+        if a.get("text_only"):
+            v.append("--text")
+        if a.get("full"):
+            v.append("--full")
+        if a.get("js"):
+            v += ["--js", a["js"]]
+        if a.get("wait"):
+            v += ["--wait", str(a["wait"])]
+        if a.get("settle"):
+            v += ["--settle", str(a["settle"])]
+        return v
+    if name == "peek_net":
+        return ["net", a["url"]] + (["--all"] if a.get("all") else [])
+    if name == "peek_fetch":
+        v = ["fetch", a["url"]]
+        if a.get("method"):
+            v += ["-X", a["method"]]
+        if a.get("data"):
+            v += ["--data", a["data"]]
+        for h in a.get("headers") or []:
+            v += ["-H", h]
+        if a.get("head"):
+            v.append("--head")
+        return v
+    if name == "peek_ports":
+        return ["ports"] + ([a["target"]] if a.get("target") else [])
+    if name == "peek_get":
+        return ["get", a["url"]] + ([a["out"]] if a.get("out") else [])
+    if name == "peek_sh":
+        return ["sh"] + (["--timeout", str(a["timeout"])] if a.get("timeout") else []) + ["--", a["cmd"]]
+    if name == "peek_sandbox":
+        return ["sandbox"] + (["--image", a["image"]] if a.get("image") else []) + (["--timeout", str(a["timeout"])] if a.get("timeout") else []) + ["--", a["cmd"]]
+    if name == "peek_env":
+        return ["env"] + (["--json"] if a.get("json") else [])
+    if name == "peek_fleet":
+        return ["fleet"]
+    if name == "peek_stamp":
+        return ["stamp"] + (["--json"] if a.get("json") else [])
+    if name == "peek_doctor":
+        return ["doctor"] + (["--deep"] if a.get("deep") else [])
+    if name == "peek_when":
+        v = ["when"] + a["words"].split()
+        if a.get("hours"):
+            v += ["--hours", str(a["hours"])]
+        if a.get("json"):
+            v.append("--json")
+        if a.get("paths"):
+            v.append("--paths")
+        return v
+    return None
+
+
+def run_mcp(argv):
+    """peek --mcp: ONE MCP stdio server. It spawns each organ's own --mcp behind a pipe, merges
+    their tools into one catalogue, forwards calls, and exposes peek's verbs as tools beside
+    them. One `claude mcp add peek -- python C:/peek/peek.py --mcp` gives an agent the whole box."""
+    import msvcrt
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+    children, owner = {}, {}
+
+    def out(obj):
+        sys.stdout.buffer.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+
+    def result(rid, res):
+        out({"jsonrpc": "2.0", "id": rid, "result": res})
+
+    def text(t, is_error=False, extra=None):
+        content = [{"type": "text", "text": t}]
+        if extra:
+            content += extra
+        return {"content": content, "isError": is_error}
+
+    def ensure_children():
+        for o in ORGANS:
+            if o["name"] in children or not o["card"].get("mcp"):
+                continue
+            p = _organ_path(o)
+            if not p:
+                continue
+            ch = _McpChild(o["name"], [p] + o["card"]["mcp"]["args"])
+            try:
+                ch.start()
+            except Exception as e:  # noqa: BLE001
+                ch.tools = []
+                ch.error = str(e)
+            children[o["name"]] = ch
+            for t in ch.tools:
+                owner[t["name"]] = ch
+
+    def own_tool_list():
+        return [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": p, "required": r}} for n, d, p, r in _OWN_TOOLS]
+
+    def call_own(name, args):
+        argv2 = _own_tool_argv(name, args)
+        if argv2 is None:
+            return text(f"unknown tool {name}", True)
+        t0 = time.time()
+        code, o, e = _run([sys.executable, str(HERE / "peek.py")] + argv2, timeout=600)
+        body = (o + ("\n[stderr] " + e if e.strip() else "")).strip() or f"(no output, exit {code})"
+        extra = []
+        if name == "peek_view" and not (args or {}).get("text_only") and SHOTS.exists():
+            shots = sorted((p for p in SHOTS.glob("*.png") if p.stat().st_mtime >= t0 - 1), key=lambda p: p.stat().st_mtime)
+            if shots and shots[-1].stat().st_size < 6 * 1024 * 1024:
+                extra.append({"type": "image", "data": base64.b64encode(shots[-1].read_bytes()).decode("ascii"), "mimeType": "image/png"})
+        return text(body, code not in (0, None), extra)
+
+    try:
+        for raw in sys.stdin.buffer:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except ValueError:
+                continue
+            rid, method = req.get("id"), req.get("method", "")
+            if method == "initialize":
+                result(rid, {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "peek", "version": PEEK_VERSION}})
+            elif method == "ping":
+                result(rid, {})
+            elif method == "tools/list":
+                ensure_children()
+                tools = own_tool_list()
+                for ch in children.values():
+                    for t in ch.tools:
+                        t2 = dict(t)
+                        t2["description"] = f"[{ch.name}] " + t.get("description", "")
+                        tools.append(t2)
+                result(rid, {"tools": tools})
+            elif method == "tools/call":
+                ensure_children()
+                params = req.get("params") or {}
+                name, args = params.get("name", ""), params.get("arguments") or {}
+                if name in {n for n, _, _, _ in _OWN_TOOLS}:
+                    result(rid, call_own(name, args))
+                elif name in owner:
+                    try:
+                        result(rid, owner[name].request("tools/call", {"name": name, "arguments": args}))
+                    except Exception as e:  # noqa: BLE001
+                        result(rid, text(f"{owner[name].name}: {e}", True))
+                else:
+                    result(rid, text(f"unknown tool: {name}", True))
+            elif rid is not None:
+                out({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}})
+    finally:
+        for ch in children.values():
+            ch.stop()
+
+
 def main():
     # Default verb is `view` (so `peek <url>` still works); `fetch` and `net`
     # are the alternate routes for when the browser view is the wrong lens or
-    # the thing that's hanging.
+    # the thing that's hanging. 0.3 adds the question verbs and the MCP aggregator.
     argv = sys.argv[1:]
+    # UTF-8 out whatever we are attached to: a pipe from Git Bash or a harness defaults to the
+    # ANSI code page and turns every "·" and "—" into mojibake; the console writer is unaffected.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     routes = {"fetch": run_fetch, "net": run_net, "ws": run_ws, "ports": run_ports,
               "get": run_get, "sh": run_sh, "sandbox": run_sandbox, "train": run_train,
-              "env": run_env, "view": run_view}
+              "env": run_env, "view": run_view,
+              "find": run_find, "who": run_who, "gpu": run_gpu, "when": run_when, "grep": run_grep, "open": run_open,
+              "fleet": run_fleet, "stamp": run_stamp, "doctor": run_doctor, "mcp": run_mcp, "--mcp": run_mcp}
     if argv and argv[0] in routes:
         return routes[argv[0]](argv[1:])
     if argv and argv[0] in ("-h", "--help", "help"):
         print(__doc__)
-        print("modes: view (default) | net | fetch | ws | ports | get | sh | sandbox")
+        print(f"peek {PEEK_VERSION}")
+        print("routes (the harness can't fence these): view (default) | net | fetch | ws | ports | get | sh | sandbox | train")
         print("  view <url>       screenshot + text + console (browser eyes)")
         print("  net <url>        request waterfall + failures (why a 200 boots blank)")
         print("  fetch <url>      raw HTTP: redirect hops + cookies + headers + body")
@@ -990,6 +1596,13 @@ def main():
         print("  sh -- <cmd>      run a command in a throwaway WSL shell")
         print("  sandbox -- <cmd> run a command in an ephemeral Docker container")
         print("  train [script]   run in the fine-tuning conda env with the GPU (streaming)")
+        print("the map:  env [--json | --mcp]   what this machine can do: host, GPU, WSL rig, Docker, services, every organ's card")
+        print("questions (peek asks the organs): find <query> [--grep W] | who | gpu | when <words> [--hours N] | grep <pattern> [paths]")
+        print("          open PATH | fleet [--json] | stamp [--json] | doctor [--deep]")
+        print("one server: peek --mcp   (every organ's MCP tools + peek's verbs as tools; register with `peek env --mcp`)")
+        return
+    if argv and argv[0] == "-v" or argv and argv[0] == "--version":
+        print(f"peek {PEEK_VERSION}")
         return
     return run_view(argv)
 

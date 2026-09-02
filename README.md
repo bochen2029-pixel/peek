@@ -47,7 +47,43 @@ needs a conda env carrying unsloth/axolotl/trl (`peek env` shows all of this).
 Everything else is browser/HTTP/socket and needs nothing but Chrome-or-Edge.
 
 **Engine coverage:** both `peek.py` and `peek.mjs` do `view / net / fetch / env /
-sh / sandbox / train`. `ws / ports / get` are Python-engine only for now.
+sh / sandbox / train`. `ws / ports / get`, the manifest, the question verbs and the
+MCP aggregator below are Python-engine only for now.
+
+## The switchboard (0.3) — one stop for an agent that has to get work done here
+
+The box carries a family of compiled instruments, each answering one question:
+[facet](https://github.com/bochen2029-pixel/facet) (which files, and where they went),
+`everywhere` (which files contain this), `everywhen` (which sessions said it),
+[vramtop](https://github.com/bochen2029-pixel/vramtop) (who holds the GPU),
+[everywho](https://github.com/bochen2029-pixel/everywho) (who is touching what, right now).
+peek does not absorb them; it fronts them. Every organ answers `--about` with one JSON
+object (verbs, MCP command, health), and peek asks instead of guessing:
+
+```
+peek env                  the map, now built from the organs' own cards (version, verbs, MCP line, health)
+peek env --json           the machine manifest for agents
+peek env --mcp            the one-line registrations: peek's aggregator, then each organ
+
+peek --mcp                ONE MCP server for all of it: each organ's tools (facet_query, io_snapshot,
+                          gpu_stamp, …) proxied through their own --mcp, plus peek's verbs as tools
+                          (peek_view returns the screenshot as an image, peek_sh, peek_sandbox, peek_fetch, …)
+                          register once:  claude mcp add peek -- python C:/peek/peek.py --mcp
+
+peek find <query> [--grep W]   which files, where they went, which contain W     (facet + everywhere)
+peek who [--agents]            who is doing I/O right now, which session          (everywho)
+peek gpu                       who holds the VRAM                                 (vramtop)
+peek when <words> [--hours N]  which sessions said it, one-week default window    (everywhen)
+peek grep <pattern> [paths]    which files contain it, at drive speed             (everywhere)
+peek open PATH                 who has it open                                    (everywho, Stage 2)
+peek fleet [--json]            every coding-harness session on the box: pids, cwd, I/O, VRAM, ports, last message
+peek stamp [--json]            one receipt line: gpu_stamp + io_stamp + listener count
+peek doctor [--deep]           is the box ready for agents; --deep runs the organs' selftests
+```
+
+The organs stay where they are and keep their own surfaces; peek owns no number. What
+changed, and why, is in [CHANGELOG.md](CHANGELOG.md); before/after snapshots of every
+edited file live under `C:\Intellect_AI_tools\_snapshots\`.
 
 ## Flags
 
